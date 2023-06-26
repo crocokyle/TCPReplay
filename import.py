@@ -27,7 +27,7 @@ class PacketCapture:
                     (packet.ip_layer.dst == self.client_ip or packet.ip_layer.dst == self.server_ip):
                 packet.direction = 'request' if packet.ip_layer.src == self.client_ip else 'response'
 
-            # We can try to auto-detect the client/server by looking at who sent/received the SYN...this is probably bad
+            # We can try to auto-detect the client/server by looking at who sent/received the SYN if IPs weren't given
             if not self.client_ip and str(packet.flags) == 'S':
                 self.client_ip = packet.ip_layer.src
                 self.server_ip = packet.ip_layer.dst
