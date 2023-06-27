@@ -4,48 +4,86 @@ from scapy.layers.inet import IP, TCP
 from scapy.packet import Packet
 from scapy.utils import PcapNgReader
 from typing import Optional
+import logging
+import json
+
+log = logging.getLogger('tcpreplay.import')
 
 
-class TCPPacket(Packet):
+class TCPPacket:
     """
-    Extends scapy.packet.Packet
+    Adds some attributes to scapy.packet.Packet
+    Not using inheritance because the Packet object has no repr
     """
-    def __init__(self):
-        super(TCPPacket, self).__init__()
-        self.ip_layer = self.getlayer(IP)
-        self.tcp_layer = self.getlayer(TCP)
-        self.l2_layer = self.getlayer(Ether)
+    def __init__(self, scapy_packet):
+        self.scapy_packet: Packet = scapy_packet
+        self.ip_layer = scapy_packet.getlayer(IP)
+        self.tcp_layer = scapy_packet.getlayer(TCP)
+        self.l2_layer = scapy_packet.getlayer(Ether)
 
         self.direction: str = ''
-
-    def decode_packet(self):
-        # TODO: This method might not be needed
-        pass
+        self.sequence_id: int = self.tcp_layer.seq
 
 
 class PacketCapture:
-    def __init__(self, filepath: Path, client_ip=None, server_ip=None):
+    def __init__(self, filepath: Path, client_ip=None, server_ip=None, client_port=None, server_port=None):
         if filepath.name[-6:] != "pcapng":
             raise ValueError(f'Provided file: {filepath} is not a .pcapng file.')
         self.filepath: Path = filepath
-
         # TODO: maybe add support for other types of pcap
-        self.packets: list[TCPPacket] = PcapNgReader(filename=str(self.filepath)).read_all().res
-        self.client_ip: str = client_ip or self._autodetect_client_server()[0]
-        self.server_ip: str = server_ip or self._autodetect_client_server()[1]
+        self.packets: list[TCPPacket] = [TCPPacket(p) for p in PcapNgReader(filename=str(self.filepath)).read_all().res]
 
-    def _autodetect_client_server(self) -> tuple[str, str]:
+        if not server_ip or not client_ip:
+            (self.client_ip, self.client_port), (self.server_ip, self.server_port) = self._autodetect_client_server()
+        else:
+            self.client_ip: str = client_ip
+            self.server_ip: str = server_ip
+            self.client_port: int = client_port
+            self.server_port: int = server_port
+
+        self.filtered = False
+
+    def _autodetect_client_server(self) -> tuple[tuple[str, int], tuple[str, int]]:
         """
         We can try to auto-detect the client/server by looking at who sent/received the SYN if IPs weren't given
         """
         for packet in self.packets:
-            if not self.client_ip and str(packet.flags) == 'S':
+            if str(packet.tcp_layer.flags) == 'S':
                 client_ip = packet.ip_layer.src
                 server_ip = packet.ip_layer.dst
+                client_port = packet.tcp_layer.sport
+                server_port = packet.tcp_layer.dport
 
-                return client_ip, server_ip
+                return (client_ip, client_port), (server_ip, server_port)
 
         raise ValueError(f'No SYN packet found in packet capture')
+
+    def _get_next_packet(self, index: int, direction: str) -> Optional[TCPPacket]:
+        """
+        Find the next response packet from an index in the packet capture list
+        """
+        this_packet = None
+        if index < len(self.packets):
+            this_packet = self.packets[index]
+            for packet in self.packets[index:]:
+                if packet.direction != direction:
+                    return packet
+
+        if this_packet:
+            log.warning(f'No more {direction}s found for request: {this_packet}')
+        return None
+
+    def assign_packet_direction(self) -> None:
+        if not self.filtered:
+            self.filter_outsiders()
+        for packet in self.packets:
+            if packet.tcp_layer.dport == self.server_port:
+                packet.direction = 'request'
+            elif packet.tcp_layer.dport == self.client_port:
+                packet.direction = 'response'
+            else:
+                log.warning(f'Found unfiltered packet in capture: {packet}')
+                continue
 
     def filter_outsiders(self) -> list[TCPPacket]:
         """
@@ -56,40 +94,63 @@ class PacketCapture:
 
         filtered_packets = list()
         for packet in self.packets:
-            if (packet.ip_layer.src == self.client_ip or packet.ip_layer.src == self.server_ip) and \
-                    (packet.ip_layer.dst == self.client_ip or packet.ip_layer.dst == self.server_ip):
+            if not packet.tcp_layer.payload:
+                continue
+            if ((packet.ip_layer.src == self.client_ip and packet.ip_layer.dst == self.server_ip) and (
+                    packet.tcp_layer.sport == self.client_port and packet.tcp_layer.dport == self.server_port)) or (
+                    (packet.ip_layer.src == self.server_ip and packet.ip_layer.dst == self.client_ip) and (
+                    packet.tcp_layer.sport == self.server_port and packet.tcp_layer.dport == self.client_port)):
                 filtered_packets.append(packet)
 
         self.packets = filtered_packets
+        self.filtered = True
         return self.packets
 
     def generate_output(self) -> dict:
-        output_data = dict()
-        self.filter_outsiders()
+        """
+        Generates two dictionaries: one where packets are keyed for mocking a server and one for mocking a client.
+        The keys in each contain the packet that the mock device expects to receive and what it should send back.
+        """
+        mock_server_output = dict()
+        mock_client_output = dict()
+        if not self.filtered:
+            self.filter_outsiders()
+        self.assign_packet_direction()
         for i, packet in enumerate(self.packets):
-            packet.direction = 'request' if packet.ip_layer.src == self.client_ip else 'response'
+            next_packet: Optional[TCPPacket] = self._get_next_packet(i, packet.direction)
+            time_until_next: float = 0 if not next_packet else next_packet.tcp_layer.time - packet.tcp_layer.time
+            next_payload: Optional[str] = None if not next_packet else next_packet.tcp_layer.payload.original.hex()
+            next_raw_packet: Optional[str] = None if not next_packet else next_packet.scapy_packet.original.hex()
 
-            # We're creating an entry in the dictionary that contains the request data as the key,
-            # the "time_until_response" and "response" data as sub-values
-            output_data[] = {
-                "time_until_response": packet,
-                "response": packet
+            dict_to_update = mock_server_output if packet.direction == 'request' else mock_client_output
+            dict_to_update[f"{packet.sequence_id}.{packet.tcp_layer.payload.original.hex()}"] = {
+                "time_until_next": time_until_next,
+                "next_payload": next_payload,
+                "this_raw_packet": packet.scapy_packet.original.hex(),
+                "next_raw_packet": next_raw_packet,
             }
-            # print(block._raw) #byte type raw data
 
-        return output_data
+        output = {
+            "mock_server": mock_server_output,
+            "mock_client": mock_server_output,
+        }
+
+        return output
 
     @staticmethod
-    def export_json(output_data):
-        pass
+    def export_json(filename: str, output: dict):
+        directory = Path('captures/decoded')
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(Path(directory, filename), 'w') as fp:
+            json.dump(output, fp, indent=4)
 
 
 def import_folder(directory: Path):
-    files = [f for f in directory.glob("**/*") if f.name[-6:] == "pcapng"]
-    for filename in files:
-        packet_capture = PacketCapture(filename)
-        output_data = packet_capture.generate_output()
-        packet_capture.export_json(output_data)
+    file_paths = [f for f in directory.glob("**/*") if f.name[-6:] == "pcapng"]
+    for path in file_paths:
+        packet_capture = PacketCapture(path)
+        output: dict = packet_capture.generate_output()
+        packet_capture.export_json(f"{path.name.split('.')[0]}.json", output)
 
 
 if __name__ == '__main__':
