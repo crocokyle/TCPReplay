@@ -1,13 +1,21 @@
+import json
+import logging
+import sys
 from pathlib import Path
-from scapy.layers.l2 import Ether
+from typing import Optional
+
 from scapy.layers.inet import IP, TCP
+from scapy.layers.l2 import Ether
 from scapy.packet import Packet
 from scapy.utils import PcapNgReader
-from typing import Optional
-import logging
-import json
 
-log = logging.getLogger('tcpreplay.import')
+log = logging.getLogger('TCPReplay.import')
+stream_handler = logging.StreamHandler(sys.stdout)
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(format=log_format, level=logging.INFO, handlers=[
+    logging.FileHandler(f"tcp_relay.log"),
+    stream_handler
+])
 
 
 class TCPPacket:
@@ -15,6 +23,7 @@ class TCPPacket:
     Adds some attributes to scapy.packet.Packet
     Not using inheritance because the Packet object has no repr
     """
+
     def __init__(self, scapy_packet):
         self.scapy_packet: Packet = scapy_packet
         self.ip_layer = scapy_packet.getlayer(IP)
@@ -30,7 +39,7 @@ class PacketCapture:
         if filepath.name[-6:] != "pcapng":
             raise ValueError(f'Provided file: {filepath} is not a .pcapng file.')
         self.filepath: Path = filepath
-        # TODO: maybe add support for other types of pcap
+        # Eventually might want to add support for other pcap types here
         self.packets: list[TCPPacket] = [TCPPacket(p) for p in PcapNgReader(filename=str(self.filepath)).read_all().res]
 
         if not server_ip or not client_ip:
@@ -69,8 +78,11 @@ class PacketCapture:
                 if packet.direction != direction:
                     return packet
 
+        replier_ip = self.client_ip if direction == 'response' else self.server_ip
         if this_packet:
-            log.warning(f'No more {direction}s found for request: {this_packet}')
+            log.warning(
+                f'No {direction}s from {replier_ip} found after: "{this_packet.tcp_layer.payload.original.hex()}"'
+            )
         return None
 
     def assign_packet_direction(self) -> None:
@@ -146,13 +158,18 @@ class PacketCapture:
 
 
 def import_folder(directory: Path):
+    log.info(f'Searching for pcapng files in "{directory}"...')
     file_paths = [f for f in directory.glob("**/*") if f.name[-6:] == "pcapng"]
+    log.info(f'Parsing {len(file_paths)} pcapng file(s)...')
     for path in file_paths:
+        log.info(f'Parsing {path.name}...')
         packet_capture = PacketCapture(path)
-        output: dict = packet_capture.generate_output()
-        packet_capture.export_json(f"{path.name.split('.')[0]}.json", output)
+        output_data: dict = packet_capture.generate_output()
+        export_filename = f"{path.name.split('.')[0]}.json"
+        log.info(f'Exporting packet capture to "{export_filename}"...')
+        packet_capture.export_json(export_filename, output_data)
+    log.info(f'Finished importing packet captures from "{directory}"')
 
 
 if __name__ == '__main__':
     import_folder(Path('captures/wireshark'))
-
