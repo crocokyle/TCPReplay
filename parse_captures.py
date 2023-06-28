@@ -9,7 +9,7 @@ from scapy.layers.l2 import Ether
 from scapy.packet import Packet
 from scapy.utils import PcapNgReader
 
-log = logging.getLogger('TCPReplay.import')
+log = logging.getLogger('TCPReplay.parse_captures')
 stream_handler = logging.StreamHandler(sys.stdout)
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(format=log_format, level=logging.INFO, handlers=[
@@ -143,6 +143,12 @@ class PacketCapture:
             }
 
         output = {
+            "metadata": {
+                "server_ip": self.server_ip,
+                "client_ip": self.client_ip,
+                "server_port": self.server_port,
+                "client_port": self.client_port,
+            },
             "mock_server": mock_server_output,
             "mock_client": mock_server_output,
         }
